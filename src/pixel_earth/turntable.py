@@ -1,10 +1,11 @@
 """Render a full rotation of cloud-free Earth from the mirrored EPIC archive.
 
 Ties the rest of the package together: :mod:`pixel_earth.catalog` picks which
-mirrored frames are worth decoding for each of ``frame_count`` evenly-spaced
-longitudes, :mod:`pixel_earth.mosaic` composites each one, and this module
-writes the results into a hashed run folder, following the same convention as
-:mod:`pixel_earth.batch`::
+mirrored frames are worth decoding across the whole rotation,
+:mod:`pixel_earth.mosaic` composites them all onto one
+:class:`~pixel_earth.mosaic.ReferenceGrid` *once*, and every output viewpoint
+then samples that same fixed grid, before this module writes the results into
+a hashed run folder, following the same convention as :mod:`pixel_earth.batch`::
 
     outputs/<run_id>/turntable/
         frames/frame_000.png ... frame_<N-1>.png   RGBA, transparent off-disc
@@ -12,6 +13,17 @@ writes the results into a hashed run folder, following the same convention as
         rotation.gif                                looping, black background
         manifest.json                                settings + per-frame stats
     outputs/latest -> <run_id>
+
+The one-shared-grid design matters beyond tidiness: rendering each viewpoint
+independently (as an earlier version of this module did) lets the *same*
+physical location flip between two different candidate photographs from one
+rotation frame to the next, whenever their cloud scores are close -- visible
+as flicker/sparkle across the animation, even though nothing in the scene
+changed. Deciding every location's winner exactly once, in a fixed lat/lon
+frame, removes that by construction: two viewpoints covering the same point
+now sample the identical decision. It is also considerably cheaper -- each
+candidate is reprojected once against the grid instead of once per viewpoint
+that happens to use it.
 """
 
 from __future__ import annotations
@@ -19,8 +31,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
-from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,12 +38,19 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, UnidentifiedImageError
 
+from pixel_earth import sheets
 from pixel_earth.batch import Settings, find_repo_root, link_latest, load_rgb
 from pixel_earth.catalog import GeometryCache, candidate_frames, load_frame_index
 from pixel_earth.cloud_score import SCORERS
 from pixel_earth.epic import Frame
 from pixel_earth.geometry import DEFAULT_MIN_COS, cap_radius_deg
-from pixel_earth.mosaic import Candidate, Viewpoint, make_viewpoint, render_viewpoint
+from pixel_earth.mosaic import (
+    Candidate,
+    Viewpoint,
+    build_reference_grid,
+    make_viewpoint,
+    render_viewpoint_from_reference,
+)
 
 _OUTPUT_DIR_NAME = "outputs"
 
@@ -54,10 +71,19 @@ class TurntableSettings:
     scorer: str = "rgb"
     collection: str = "natural"
     fmt: str = "png"
+    # The shared reference grid's resolution, as a multiple of `radius` --
+    # bigger keeps more native detail when a viewpoint samples back out of
+    # it, at the cost of reprojecting every candidate onto more cells.
+    reference_scale: float = 4.0
     segment_settings: Settings = field(default_factory=Settings)
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+    def reference_size(self) -> tuple[int, int]:
+        """(width, height) of the shared equirectangular reference grid."""
+        width = max(2, int(round(self.radius * self.reference_scale)))
+        return width, width // 2
 
 
 @dataclass
@@ -65,7 +91,6 @@ class FrameReport:
     index: int
     lon: float
     output: str  # path relative to the run directory
-    candidate_count: int
     suspect_fraction: float
 
 
@@ -75,6 +100,8 @@ class TurntableReport:
     run_dir: Path
     mirror_root: Path
     settings: TurntableSettings
+    reference_candidate_count: int  # frames composited into the shared grid
+    reference_coverage: float  # fraction of the reference grid's cells with data
     frames: list[FrameReport]
 
     @property
@@ -101,34 +128,65 @@ def build_viewpoints(settings: TurntableSettings) -> list[Viewpoint]:
     ]
 
 
-class _DecodedFrameCache:
-    """Bounded LRU of decoded frames, since adjacent viewpoints share most of
-    their candidates -- without a cache each shared frame would be re-decoded
-    once per viewpoint that uses it."""
+def _decode(frame: Frame, root: Path, fmt: str) -> np.ndarray | None:
+    path = frame.local_path(root, fmt)
+    try:
+        return load_rgb(path) if path.exists() else None
+    except (UnidentifiedImageError, OSError, ValueError):
+        return None
 
-    def __init__(self, root: Path, fmt: str, *, capacity: int = 64):
-        self._root = root
-        self._fmt = fmt
-        self._capacity = capacity
-        self._store: OrderedDict[str, np.ndarray | None] = OrderedDict()
 
-    def get(self, frame: Frame) -> np.ndarray | None:
-        key = frame.image
-        if key in self._store:
-            self._store.move_to_end(key)
-            return self._store[key]
+def _gather_candidates(
+    root: Path,
+    settings: TurntableSettings,
+    viewpoints: list[Viewpoint],
+    index: list[Frame],
+    geometry_cache: GeometryCache,
+    *,
+    on_decode_progress=None,
+) -> list[Candidate]:
+    """Every frame that's a candidate for *any* viewpoint in the rotation,
+    decoded once each. This is deliberately the union across all viewpoints,
+    not per-viewpoint -- the whole point of the reference grid is that a
+    given physical point's winner is decided once from everything that could
+    ever see it, not re-decided per rotation angle.
 
-        path = frame.local_path(self._root, self._fmt)
-        try:
-            rgb = load_rgb(path) if path.exists() else None
-        except (UnidentifiedImageError, OSError, ValueError):
-            rgb = None
+    The cost of that is memory, and it is the one number to keep an eye on
+    here. The union is held decoded all at once (an earlier per-viewpoint
+    version could get away with a bounded LRU cache, because it only ever
+    needed one viewpoint's candidates at a time), and
+    :func:`~pixel_earth.mosaic.build_reference_grid` then stacks a sample of
+    every one of them over the grid. Roughly, in bytes:
 
-        self._store[key] = rgb
-        self._store.move_to_end(key)
-        if len(self._store) > self._capacity:
-            self._store.popitem(last=False)
-        return rgb
+        3 * H * W * len(candidates)              decoded frames, uint8
+        + 24 * height * width * len(candidates)  the score/rgb/argsort stacks
+
+    -- so the shipped ``--frames 72 --radius 360`` run (620 candidates of
+    2048^2, onto a 1440x720 grid) peaks near 23 GiB. ``--max-candidates``
+    bounds the first term per viewpoint but not the union; ``--reference-scale``
+    is the direct lever on the second."""
+    cap = cap_radius_deg(settings.min_cos)
+    seen: dict[str, Frame] = {}
+    for viewpoint in viewpoints:
+        for frame in candidate_frames(
+            viewpoint.lat0,
+            viewpoint.lon0,
+            index,
+            cap_radius_deg=cap,
+            max_candidates=settings.max_candidates,
+        ):
+            seen.setdefault(frame.image, frame)
+
+    candidates: list[Candidate] = []
+    for done, frame in enumerate(seen.values(), start=1):
+        geometry = geometry_cache.get(frame)
+        if geometry is not None and geometry.looks_like_disc:
+            rgb = _decode(frame, root, settings.fmt)
+            if rgb is not None:
+                candidates.append(Candidate(geometry=geometry, rgb=rgb))
+        if on_decode_progress is not None:
+            on_decode_progress(done, len(seen))
+    return candidates
 
 
 def render_all(
@@ -139,8 +197,9 @@ def render_all(
     write_gif: bool = True,
     write_contact_sheet: bool = True,
     on_progress=None,
+    on_reference_progress=None,
 ) -> TurntableReport:
-    """Render every viewpoint and write the run folder described above."""
+    """Build the shared reference grid, then render every viewpoint from it."""
     identifier = run_id(root, settings)
     run_dir = out_root / identifier
     turntable_dir = run_dir / "turntable"
@@ -149,97 +208,69 @@ def render_all(
 
     scorer = SCORERS[settings.scorer]
     index = load_frame_index(root, settings.collection)
-    cap = cap_radius_deg(settings.min_cos)
     viewpoints = build_viewpoints(settings)
+
+    with GeometryCache(root, settings=settings.segment_settings, fmt=settings.fmt) as geometry_cache:
+        candidates = _gather_candidates(
+            root,
+            settings,
+            viewpoints,
+            index,
+            geometry_cache,
+            on_decode_progress=on_reference_progress,
+        )
+
+    width, height = settings.reference_size()
+    grid = build_reference_grid(
+        width,
+        height,
+        candidates,
+        scorer=scorer,
+        min_cos=settings.min_cos,
+        luminance_floor=settings.luminance_floor,
+        obliqueness_penalty=settings.obliqueness_penalty,
+        blend_k=settings.blend_k,
+        blend_margin=settings.blend_margin,
+    )
 
     frame_reports: list[FrameReport] = []
     frame_paths: list[Path] = []
 
-    with GeometryCache(root, settings=settings.segment_settings, fmt=settings.fmt) as geometry_cache:
-        decoded = _DecodedFrameCache(root, settings.fmt)
+    for i, viewpoint in enumerate(viewpoints):
+        result = render_viewpoint_from_reference(viewpoint, grid)
 
-        for i, viewpoint in enumerate(viewpoints):
-            candidate_meta = candidate_frames(
-                viewpoint.lat0,
-                viewpoint.lon0,
-                index,
-                cap_radius_deg=cap,
-                max_candidates=settings.max_candidates,
+        frame_path = frames_dir / f"frame_{i:03d}.png"
+        Image.fromarray(result.rgba, "RGBA").save(frame_path)
+        frame_paths.append(frame_path)
+
+        frame_reports.append(
+            FrameReport(
+                index=i,
+                lon=viewpoint.lon0,
+                output=str(frame_path.relative_to(run_dir)),
+                suspect_fraction=result.suspect_fraction,
             )
-
-            candidates: list[Candidate] = []
-            for frame in candidate_meta:
-                geometry = geometry_cache.get(frame)
-                if geometry is None or not geometry.looks_like_disc:
-                    continue
-                rgb = decoded.get(frame)
-                if rgb is None:
-                    continue
-                candidates.append(Candidate(geometry=geometry, rgb=rgb))
-
-            result = render_viewpoint(
-                viewpoint,
-                candidates,
-                scorer=scorer,
-                min_cos=settings.min_cos,
-                luminance_floor=settings.luminance_floor,
-                obliqueness_penalty=settings.obliqueness_penalty,
-                blend_k=settings.blend_k,
-                blend_margin=settings.blend_margin,
-            )
-
-            frame_path = frames_dir / f"frame_{i:03d}.png"
-            Image.fromarray(result.rgba, "RGBA").save(frame_path)
-            frame_paths.append(frame_path)
-
-            frame_reports.append(
-                FrameReport(
-                    index=i,
-                    lon=viewpoint.lon0,
-                    output=str(frame_path.relative_to(run_dir)),
-                    candidate_count=len(candidates),
-                    suspect_fraction=result.suspect_fraction,
-                )
-            )
-            if on_progress is not None:
-                on_progress(i + 1, len(viewpoints), frame_reports[-1])
+        )
+        if on_progress is not None:
+            on_progress(i + 1, len(viewpoints), frame_reports[-1])
 
     if write_contact_sheet and frame_paths:
-        _write_contact_sheet(frame_paths, turntable_dir / "contact_sheet.png")
+        sheets.write_contact_sheet(frame_paths, turntable_dir / "contact_sheet.png")
     if write_gif and frame_paths:
-        _write_rotation_gif(frame_paths, turntable_dir / "rotation.gif")
+        sheets.write_rotation_gif(frame_paths, turntable_dir / "rotation.gif")
 
-    report = TurntableReport(identifier, run_dir, root, settings, frame_reports)
+    report = TurntableReport(
+        identifier,
+        run_dir,
+        root,
+        settings,
+        reference_candidate_count=len(candidates),
+        reference_coverage=float(grid.has_data.mean()),
+        frames=frame_reports,
+    )
     _write_manifest(report)
     link_latest(run_dir)
     return report
-
-
-def _flatten_on_black(path: Path) -> Image.Image:
-    img = Image.open(path).convert("RGBA")
-    canvas = Image.new("RGB", img.size, (0, 0, 0))
-    canvas.paste(img, mask=img.split()[3])
-    return canvas
-
-
-def _write_contact_sheet(frame_paths: list[Path], out: Path) -> None:
-    flattened = [_flatten_on_black(p) for p in frame_paths]
-    width, height = flattened[0].size
-    columns = max(1, math.ceil(math.sqrt(len(flattened))))
-    rows = math.ceil(len(flattened) / columns)
-
-    sheet = Image.new("RGB", (columns * width, rows * height), (0, 0, 0))
-    for i, img in enumerate(flattened):
-        x, y = (i % columns) * width, (i // columns) * height
-        sheet.paste(img, (x, y))
-    sheet.save(out)
-
-
-def _write_rotation_gif(frame_paths: list[Path], out: Path, *, duration_ms: int = 80) -> None:
-    flattened = [_flatten_on_black(p) for p in frame_paths]
-    flattened[0].save(
-        out, save_all=True, append_images=flattened[1:], duration=duration_ms, loop=0
-    )
 
 
 def _write_manifest(report: TurntableReport) -> Path:
@@ -248,6 +279,8 @@ def _write_manifest(report: TurntableReport) -> Path:
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "mirror_root": str(report.mirror_root.resolve()),
         "settings": report.settings.as_dict(),
+        "reference_candidate_count": report.reference_candidate_count,
+        "reference_coverage": report.reference_coverage,
         "mean_suspect_fraction": report.mean_suspect_fraction,
         "frames": [asdict(f) for f in report.frames],
     }
@@ -273,6 +306,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--blend-k", type=int, default=TurntableSettings.blend_k)
     parser.add_argument("--blend-margin", type=float, default=TurntableSettings.blend_margin)
     parser.add_argument("--max-candidates", type=int, default=TurntableSettings.max_candidates)
+    parser.add_argument(
+        "--reference-scale", type=float, default=TurntableSettings.reference_scale,
+        help="shared reference grid width, as a multiple of --radius (default: %(default)s)",
+    )
     parser.add_argument("--scorer", choices=sorted(SCORERS), default=TurntableSettings.scorer)
     parser.add_argument("--collection", default=TurntableSettings.collection)
     parser.add_argument("--fmt", default=TurntableSettings.fmt)
@@ -294,6 +331,7 @@ def main(argv: list[str] | None = None) -> int:
         blend_k=args.blend_k,
         blend_margin=args.blend_margin,
         max_candidates=args.max_candidates,
+        reference_scale=args.reference_scale,
         scorer=args.scorer,
         collection=args.collection,
         fmt=args.fmt,
@@ -304,13 +342,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"not a directory: {args.mirror}")
         return 2
 
+    width, height = settings.reference_size()
+    print(f"building {width}x{height} reference grid...")
+
+    def reference_progress(done: int, total: int) -> None:
+        if done == total or done % 25 == 0:
+            print(f"  decoded {done}/{total} candidate frames")
+
     def progress(done: int, total: int, frame: FrameReport) -> None:
         flag = " REVIEW" if frame.suspect_fraction > 0.05 else ""
-        print(
-            f"[{done}/{total}] lon {frame.lon:6.1f}  "
-            f"{frame.candidate_count:3d} candidates  "
-            f"suspect {frame.suspect_fraction:5.1%}{flag}"
-        )
+        print(f"[{done}/{total}] lon {frame.lon:6.1f}  suspect {frame.suspect_fraction:5.1%}{flag}")
 
     report = render_all(
         args.mirror,
@@ -319,9 +360,14 @@ def main(argv: list[str] | None = None) -> int:
         write_gif=not args.no_gif,
         write_contact_sheet=not args.no_contact_sheet,
         on_progress=progress,
+        on_reference_progress=reference_progress,
     )
 
     print(f"\nrun {report.run_id} -> {report.run_dir}")
+    print(
+        f"  reference grid: {report.reference_candidate_count} candidates, "
+        f"{report.reference_coverage:.1%} coverage"
+    )
     print(f"  mean suspect fraction: {report.mean_suspect_fraction:.1%}")
     review = [f for f in report.frames if f.suspect_fraction > 0.05]
     if review:

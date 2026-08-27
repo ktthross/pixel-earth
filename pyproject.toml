@@ -17,6 +17,7 @@ pixel-earth = "pixel_earth.app:main"
 pixel-earth-batch = "pixel_earth.batch:main"
 pixel-earth-fetch = "pixel_earth.epic:main"
 pixel-earth-turntable = "pixel_earth.turntable:main"
+pixel-earth-pixelart = "pixel_earth.sprites:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]

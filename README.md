@@ -191,20 +191,30 @@ uv run pixel-earth-turntable data/epic --frames 72
 ```
 
 A full 360° rotation, cloud-free, built entirely from frames already mirrored
-locally — no reprojection round-trip through one persistent global raster.
-For each of `--frames` evenly-spaced output longitudes,
-[catalog.py](src/pixel_earth/catalog.py) picks the mirrored frames whose own
-sub-satellite point could plausibly see that viewpoint (metadata only, no
-image decoded yet — one UTC day sweeps the whole 360°, but a given longitude
-is only ever lit the same way on *some* days, since sub-satellite latitude
-tracks the season), then [mosaic.py](src/pixel_earth/mosaic.py) reprojects
-each candidate frame's own pixels straight into the output viewpoint's
-orthographic geometry (same projection as [segment.py](src/pixel_earth/segment.py)'s
-disc, via [geometry.py](src/pixel_earth/geometry.py)) and keeps, pixel by
-pixel, the single least-cloudy candidate's whole `(R, G, B)` — never a
-per-channel synthesis across frames, which is what darkened and discoloured
-an earlier, unshipped attempt at this badly enough that it needed a
-brightness-gain-matching patch afterwards.
+locally. [catalog.py](src/pixel_earth/catalog.py) first picks every mirrored
+frame that could plausibly see *any* of the `--frames` output longitudes
+(metadata only, no image decoded yet — one UTC day sweeps the whole 360°, but
+a given longitude is only ever lit the same way on *some* days, since
+sub-satellite latitude tracks the season). [mosaic.py](src/pixel_earth/mosaic.py)
+then reprojects every one of those candidates, once each, onto a single small
+equirectangular `ReferenceGrid` (same orthographic projection as
+[segment.py](src/pixel_earth/segment.py)'s disc, via [geometry.py](src/pixel_earth/geometry.py)),
+keeping, per grid cell, the single least-cloudy candidate's whole `(R, G, B)`
+— never a per-channel synthesis across frames, which is what darkened and
+discoloured an earlier, unshipped attempt at this badly enough that it needed
+a brightness-gain-matching patch afterwards. Every output viewpoint then just
+*samples* that one grid.
+
+That grid is a deliberate, small-scale return to something this module's
+first version explicitly avoided (a persistent global raster) — because
+rendering each viewpoint fully independently turned out to have a real cost:
+the same physical location could flip between two different source
+photographs from one rotation frame to the next whenever their cloud scores
+were close, since the "least cloudy" decision was being remade from scratch
+per viewpoint. Deciding it once, in a fixed lat/lon frame, removes that by
+construction — two viewpoints covering the same point sample the identical
+decision — and is considerably cheaper besides, since each candidate is
+reprojected once total instead of once per viewpoint that happens to use it.
 
 Cloudiness is scored by brightness × whiteness² (bright + colourless = cloud,
 [cloud_score.py](src/pixel_earth/cloud_score.py)) — visible light only, so it
@@ -220,18 +230,19 @@ disc out of that chrome first, which is real scope beyond "swap the score
 function," so it's parked as a documented no-go for now
 (`cloud_score.cloudfraction_score`).
 
-### Measured on the full 1014-frame, 63-day mirror
+### Measured on the full 1014-frame, 63-day mirror, `--frames 72 --radius 360`
 
 | | value |
 |---|---|
-| `mean_suspect_fraction` (no trustworthy pixel found) | 0.49% |
-| worst single frame | 0.91% |
-| candidates considered per output frame | 46–48 (of `--max-candidates 48`) |
-| render time | ~4s/frame at `--radius 360`, ~24s/frame at `--radius 800` |
+| `mean_suspect_fraction` (no trustworthy pixel found) | ~0.0005% |
+| `reference_candidate_count` (unique frames composited into the grid) | 620 |
+| `reference_coverage` (fraction of the grid with any data) | 97.9% |
+| total render time, all 72 frames | ~1m50s |
 
-`suspect_fraction` per frame is in `manifest.json` — deliberately not hidden
-or covered up, since coverage is naturally thinner at longitudes only ever
-photographed far from the equinoxes.
+`suspect_fraction` per frame and the reference-grid stats above are all in
+`manifest.json` — deliberately not hidden or covered up, since coverage is
+naturally thinner at longitudes only ever photographed far from the
+equinoxes.
 
 ### What it does not do
 
@@ -242,12 +253,118 @@ texture there instead of a crisp cutout. Blending across more near-tied
 candidates (`--blend-k`) doesn't fix this — it's a scoring blind spot, not a
 selection one — so it's the same class of known limitation as snow/ice.
 
+## Piece 5 — pixel art (done)
+
+```bash
+uv run pixel-earth-pixelart outputs/<turntable-run-id> --sizes 16,32,64,128
+```
+
+Takes a turntable run's RGBA frames and, per requested size, runs each
+through [pixelart.py](src/pixel_earth/pixelart.py)'s pipeline: `grade` (colour
+towards a punchier "expected Earth" look — see below), `downsample_rgba`
+(shrink to the working grid), quantize to a small fixed palette, then
+`upscale_nearest` back up for viewing. [sprites.py](src/pixel_earth/sprites.py)
+is the CLI/orchestration layer, following the same hashed-run-folder
+convention as [turntable.py](src/pixel_earth/turntable.py).
+
+**Colour grading** (`grade`) is a `--stylize` knob from 0 (the true, muted
+colour DSCOVR actually saw) to 1 (fully graded), built from three
+per-pixel-only operations — a gamma brightness lift (real EPIC frames are
+*dark*, median brightness ~0.3, not washed-out-grey), a post-lift contrast
+curve, and a saturation *vibrance* curve. None of it depends on where a pixel
+sits in the image, so it can't mistint a specific feature. On top of that,
+`land_green` rotates tan/brown land hues (true land clusters at 20-50°,
+essentially no green in the raw data) toward green by up to 90°, weighted
+down by brightness — real deserts are dramatically brighter than vegetation,
+so bright land mostly keeps its true tan while darker land goes green. Ask
+for less green with `--land-green`, less pop with `--stylize`,
+`--saturation-boost`, `--gamma`, `--contrast`.
+
+**Downsampling** defaults to nearest-neighbour (`--downsample nearest`) — one
+source pixel per output cell, no averaging, so region boundaries land as one
+hard step rather than a soft gradient. That boldness has a cost across a
+*sequence*: a single sample per cell aliases at hard edges (coastlines) as
+the viewpoint rotates by fractions of a pixel between frames, visible as
+flicker even when the underlying colour is perfectly stable.
+`--supersample N` (default 8) takes N×N nearest-neighbour samples per output
+cell and averages just those — interior cells are still one flat colour (all
+N² samples agree), but a cell straddling a boundary blends smoothly instead
+of aliasing between two extremes.
+
+**Palette**: `--shared-palette` (on by default) discovers one palette from
+every frame in the sequence combined, and quantizes each frame against that
+same palette — the fix for a second, independent kind of flicker: two frames
+showing different parts of the globe otherwise discover slightly different
+optimal palettes, so an unchanged true colour can snap to a different swatch
+frame to frame.
+
+### Temporal consistency
+
+The reference-grid rework in Piece 4 and the shared palette here exist for
+the same reason: a rotation is only as good as its *worst* frame-to-frame
+jump. Verified directly — sampling a single physical point (5°N, 20°E)
+across ten adjacent rotation frames of the pixel-art output — its colour is
+`(123, 138, 105)` in every one of them, exactly. Some smaller residual
+variation (mostly tens of RGB units, at points sitting directly on a
+coastline) remains and is expected: it's genuine sub-pixel aliasing of a hard
+edge in a low-resolution rotating render, not a data or logic bug, and
+`--supersample` is the lever for trading render time against how much of it
+gets smoothed away.
+
+### Known-good preset — `pixelart-15ae4b74`
+
+<img src="outputs/pixelart-15ae4b74/128px/rotation.gif" alt="A 128x128 pixel-art Earth rotating through a full 360 degrees, cloud-free, in muted natural greens and tans" width="384">
+
+The settings behind a run the author was particularly happy with, recorded
+here so they don't get lost to a future default change (full settings are
+also in that run's own `manifest.json`, alongside its source turntable run's):
+
+```bash
+uv run pixel-earth-turntable data/epic --frames 72 --radius 360
+# -> outputs/58c4e1f6 (620 reference candidates, 97.9% coverage, ~1m50s)
+
+uv run pixel-earth-pixelart outputs/58c4e1f6 --sizes 16,32,64,128
+# -> outputs/pixelart-15ae4b74
+```
+
+At the time of this run, every value above was simply the shipped default —
+`stylize=1.0, saturation_boost=1.8, gamma=2.4, contrast=0.35, black_point=0.05,
+land_green=1.0, colors=32, dither=false, downsample_method=nearest,
+supersample=8, shared_palette=true`. If defaults ever drift, this preset
+still reproduces exactly by pinning those values explicitly on the command
+line.
+
+### Pushed preset — `pixelart-cf6abfd1`
+
+<img src="outputs/pixelart-cf6abfd1/128px/rotation.gif" alt="The same rotating pixel-art Earth, graded harder: stronger saturation and contrast on a smaller 24-colour palette, giving a bolder retro-game-map look" width="384">
+
+Same source rotation (`outputs/58c4e1f6`), turned up for a bolder, more
+saturated "retro game map" look:
+
+```bash
+uv run pixel-earth-pixelart outputs/58c4e1f6 --sizes 16,32,64,128 \
+  --saturation-boost 2.5 --gamma 2.6 --contrast 0.5 --colors 24
+# -> outputs/pixelart-cf6abfd1
+```
+
+Full settings: `stylize=1.0, saturation_boost=2.5, gamma=2.6, contrast=0.5,
+black_point=0.05, land_green=1.0, colors=24, dither=false,
+downsample_method=nearest, supersample=8, shared_palette=true` — every value
+not listed on the command line above is still the shipped default.
+
+Getting here overshot once: an earlier attempt also dropped `--colors` to 16,
+which merged the Sahara and the savanna belt below it into the same washed
+yellow-green swatch — less interesting, not more. Fewer colours isn't
+automatically "more pixel art"; `colors=24` was the point where cutting the
+palette stopped helping and started erasing real distinctions the higher
+saturation/contrast had just made sharper.
+
 ## Next pieces
 
-5. **Click to select** — `gr.Image.select` gives the click point for free; use
+7. **Click to select** — `gr.Image.select` gives the click point for free; use
    it to seed a flood fill, or to pick among candidate blobs.
-6. **GrabCut** — for when the Earth is not a disc (a map, a globe on a desk).
-7. **SAM** — click-to-mask, best quality, ~350MB of torch.
+8. **GrabCut** — for when the Earth is not a disc (a map, a globe on a desk).
+9. **SAM** — click-to-mask, best quality, ~350MB of torch.
 
 **Hough circle**, previously piece 3, is deferred indefinitely. It was the fix
 for a clipped terminator, and DSCOVR never produces one.

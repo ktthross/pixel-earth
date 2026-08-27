@@ -9,7 +9,15 @@ from conftest import synthetic_viewpoint_frame
 from pixel_earth.catalog import FrameGeometry
 from pixel_earth.cloud_score import rgb_heuristic_score
 from pixel_earth.epic import Frame
-from pixel_earth.mosaic import Candidate, make_viewpoint, render_viewpoint
+from pixel_earth.geometry import forward
+from pixel_earth.mosaic import (
+    Candidate,
+    build_reference_grid,
+    make_viewpoint,
+    render_viewpoint,
+    render_viewpoint_from_reference,
+    sample_reference_grid,
+)
 
 QUADRANTS = {
     "NW": (20, 60, 140),  # ocean blue
@@ -166,3 +174,87 @@ def test_contributor_indexes_the_winning_candidate(viewpoint):
     result = render_viewpoint(viewpoint, [cloudy, clear], scorer=rgb_heuristic_score)
     row, col = _quadrant_pixel(viewpoint, "NW")
     assert result.contributor[row, col] == 1  # index of `clear` in the candidates list
+
+
+# ------------------------------------------------------------ reference grid
+
+
+def test_reference_grid_picks_the_least_cloudy_candidate():
+    cloudy = _candidate("cloudy", make_viewpoint(0.0, 0.0, radius=60), cloudy_quadrants=("NW", "NE", "SW", "SE"))
+    clear = _candidate("clear", make_viewpoint(0.0, 0.0, radius=60))
+
+    grid = build_reference_grid(360, 180, [cloudy, clear], scorer=rgb_heuristic_score)
+
+    # (lat 0, lon 0) is dead centre of both candidates' discs, in the NW/NE/SW/SE
+    # boundary; nudge slightly into the NW quadrant instead.
+    row = int((90.0 - 20.0) / 180.0 * 180)
+    col = int((-20.0 + 180.0) / 360.0 * 360)
+    assert tuple(grid.rgb[row, col]) == QUADRANTS["NW"]
+    assert grid.has_data[row, col]
+
+
+def test_reference_grid_has_no_data_where_nothing_is_visible():
+    grid = build_reference_grid(360, 180, [], scorer=rgb_heuristic_score)
+    assert not grid.has_data.any()
+
+
+def test_sample_reference_grid_agrees_regardless_of_which_viewpoint_asks():
+    # The whole point: the same physical location must resolve to the same
+    # colour no matter which rotation frame's geometry is asking for it --
+    # that's what removes cross-frame flicker.
+    cloudy = _candidate("cloudy", make_viewpoint(0.0, 0.0, radius=80), cloudy_quadrants=("NW", "NE", "SW", "SE"))
+    clear = _candidate("clear", make_viewpoint(0.0, 0.0, radius=80))
+    grid = build_reference_grid(720, 360, [cloudy, clear], scorer=rgb_heuristic_score)
+
+    lat, lon = 15.0, 15.0  # NE quadrant, well inside both candidates' discs
+
+    for lon0 in (0.0, 40.0, 200.0, -150.0):
+        rgb, has_data = sample_reference_grid(grid, np.array([lat]), np.array([lon]))
+        if lon0 == 0.0:
+            first_rgb = rgb
+        assert has_data[0]
+        assert np.allclose(rgb, first_rgb, atol=1.0)
+
+
+def test_sample_reference_grid_wraps_the_antimeridian():
+    # A cell just past +180 should read the same as the equivalent cell just
+    # past -180 -- there is no seam, even though the grid array itself ends.
+    # A flat-colour candidate (no internal quadrant edge) isolates the wrap
+    # behaviour from bilinear blending across a nearby hard colour boundary.
+    flat = _candidate("flat", make_viewpoint(0.0, 179.5, radius=80), colors={k: (90, 140, 60) for k in QUADRANTS})
+    grid = build_reference_grid(720, 360, [flat], scorer=rgb_heuristic_score)
+
+    rgb_pos, has_pos = sample_reference_grid(grid, np.array([15.0]), np.array([179.9]))
+    rgb_neg, has_neg = sample_reference_grid(grid, np.array([15.0]), np.array([-179.9]))
+    assert has_pos[0] and has_neg[0]
+    assert np.allclose(rgb_pos, rgb_neg, atol=2.0)
+
+
+def test_sample_reference_grid_reports_no_data_far_from_any_candidate():
+    clear = _candidate("clear", make_viewpoint(0.0, 0.0, radius=80))
+    grid = build_reference_grid(360, 180, [clear], scorer=rgb_heuristic_score)
+
+    _, has_data = sample_reference_grid(grid, np.array([0.0]), np.array([175.0]))
+    assert not has_data[0]
+
+
+def test_render_viewpoint_from_reference_is_identical_across_rotation_frames():
+    # The actual bug this exists to fix: render_viewpoint (independent per
+    # frame) can flip its winning candidate for the same physical point
+    # between nearby viewpoints when two candidates are close in score.
+    # render_viewpoint_from_reference must not, since the decision was
+    # already made once, in the grid.
+    near_tie_a = _candidate("a", make_viewpoint(0.0, 0.0, radius=100), colors={k: (140, 145, 150) for k in QUADRANTS})
+    near_tie_b = _candidate("b", make_viewpoint(0.0, 0.0, radius=100), colors={k: (141, 144, 149) for k in QUADRANTS})
+    grid = build_reference_grid(720, 360, [near_tie_a, near_tie_b], scorer=rgb_heuristic_score)
+
+    lat, lon = 10.0, 10.0
+    samples = []
+    for lon0 in (0.0, 15.0, 30.0, 45.0, 60.0):
+        vp = make_viewpoint(0.0, lon0, radius=200)
+        col, row, cos_c = forward(np.array([lat]), np.array([lon]), geometry=vp.geometry)
+        assert cos_c[0] > 0  # sanity: the point is actually on this viewpoint's disc
+        result = render_viewpoint_from_reference(vp, grid)
+        samples.append(tuple(result.rgba[round(float(row[0])), round(float(col[0])), :3]))
+
+    assert len(set(samples)) == 1  # every frame agrees on this point's colour

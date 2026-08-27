@@ -217,8 +217,18 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# pixel-earth batch output (images; manifests are small but tracked per-run)
-outputs/
+# pixel-earth run output: large, and reproducible from the command in the
+# manifest, so it is ignored wholesale -- except the two rotations the README
+# embeds, which have to survive a fresh clone.
+#
+# git will not descend into an excluded directory, so re-including a file deep
+# inside one means re-including each directory on the way down first; the two
+# `!outputs/*/` lines do that, and `outputs/**` keeps their *contents* ignored.
+outputs/**
+!outputs/*/
+!outputs/*/*/
+!outputs/pixelart-15ae4b74/128px/rotation.gif
+!outputs/pixelart-cf6abfd1/128px/rotation.gif
 
 # EPIC archive mirror (large; re-fetchable via pixel-earth-fetch)
 data/epic/
