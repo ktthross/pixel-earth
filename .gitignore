@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# pixel-earth batch output (images; manifests are small but tracked per-run)
+outputs/
+
+# EPIC archive mirror (large; re-fetchable via pixel-earth-fetch)
+data/epic/
